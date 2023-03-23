@@ -71,10 +71,15 @@
 #define CONFIG_LATENCY_HISTOGRAM_MAX_VALUE 3000000L          /* <= 3 secs(us precision) */
 #define CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE 3000000L   /* <= 3 secs(us precision) */
 #define SHOW_THROUGHPUT_INTERVAL 250  /* 250ms */
+#define MAX_ROWS 1000000000L
+#define MAX_COLS 16
 
 #define CLIENT_GET_EVENTLOOP(c) \
     (c->thread_id >= 0 ? config.threads[c->thread_id]->el : config.el)
 
+static char *gauss_data;           /* Randomized gaussian data(keys) */
+static size_t gauss_index = 0;     /* Current index of the gauss_data */
+static long long total_rows = 0;   /* Real rows of gauss_data */
 struct benchmarkThread;
 struct clusterNode;
 struct redisConfig;
@@ -123,6 +128,7 @@ static struct config {
     redisAtomic int is_updating_slots;
     redisAtomic int slots_last_update;
     int enable_tracking;
+    int gaussian_dist;
     pthread_mutex_t liveclients_mutex;
     pthread_mutex_t is_updating_slots_mutex;
     int resp3; /* use RESP3 */
@@ -418,14 +424,50 @@ static void resetClient(client c) {
     c->pending = config.pipeline;
 }
 
+static void readGaussianData() {
+    FILE *fp = fopen("../data/gauss_data.csv", "r");
+    if (fp == NULL) {
+        fprintf(stderr, "Error: cannot open file.\n");
+        exit(1);
+    }
+
+    long long i = 0;
+    char line[2 * MAX_COLS];
+    if (fgets(line, 2 * MAX_COLS, fp) == NULL || strstr(line, "key") == NULL) {
+        fprintf(stderr, "Error: incorrect file content.\n");
+        fclose(fp);
+        exit(1);
+    }
+
+    total_rows = strtoll(strstr(line, ":") + 1, NULL, 10);
+    total_rows = total_rows > MAX_ROWS ? MAX_ROWS : total_rows;
+    gauss_data = zmalloc(total_rows * MAX_COLS);
+
+    while (fgets(gauss_data + i*MAX_COLS, MAX_COLS, fp) != NULL)
+        i++;
+    
+    fclose(fp);
+}
+
+static size_t getGaussianKey() {
+    size_t key = (size_t)atoi(gauss_data + gauss_index*MAX_COLS);
+    gauss_index = (gauss_index + 1) % total_rows;
+    return key;
+}
+
 static void randomizeClientKey(client c) {
     size_t i;
 
     for (i = 0; i < c->randlen; i++) {
         char *p = c->randptr[i]+11;
         size_t r = 0;
-        if (config.randomkeys_keyspacelen != 0)
-            r = random() % config.randomkeys_keyspacelen;
+        if (config.randomkeys_keyspacelen != 0) {
+            if(config.gaussian_dist) {
+                r = getGaussianKey();
+            } else {
+                r = random() % config.randomkeys_keyspacelen;
+            }
+        }
         size_t j;
 
         for (j = 0; j < 12; j++) {
@@ -1526,6 +1568,8 @@ int parseOptions(int argc, char **argv) {
             config.cluster_mode = 1;
         } else if (!strcmp(argv[i],"--enable-tracking")) {
             config.enable_tracking = 1;
+        } else if (!strcmp(argv[i],"--gaussian-dist")) {
+            config.gaussian_dist = 1;
         } else if (!strcmp(argv[i],"--help")) {
             exit_status = 0;
             goto usage;
@@ -1567,6 +1611,7 @@ int parseOptions(int argc, char **argv) {
         }
     }
 
+    config.gaussian_dist &= config.randomkeys;
     return i;
 
 invalid:
@@ -1605,6 +1650,8 @@ usage:
 "                    range.\n"
 "                    Note: If -r is omitted, all commands in a benchmark will\n"
 "                    use the same key.\n"
+"--gaussian-dist     Use keys that match the Gaussian distribution.\n"
+"                    Note: If -r is omitted, this option will be invalid.\n"
 " -P <numreq>        Pipeline <numreq> requests. Default 1 (no pipeline).\n"
 " -q                 Quiet. Just show query/sec values\n"
 " --precision        Number of decimal places to display in latency output (default 0)\n"
@@ -1761,6 +1808,7 @@ int main(int argc, char **argv) {
     config.is_updating_slots = 0;
     config.slots_last_update = 0;
     config.enable_tracking = 0;
+    config.gaussian_dist = 0;
     config.resp3 = 0;
 
     i = parseOptions(argc,argv);
@@ -1855,6 +1903,9 @@ int main(int argc, char **argv) {
     }
     if(config.csv){
         printf("\"test\",\"rps\",\"avg_latency_ms\",\"min_latency_ms\",\"p50_latency_ms\",\"p95_latency_ms\",\"p99_latency_ms\",\"max_latency_ms\"\n");
+    }
+    if(config.gaussian_dist){
+        readGaussianData();
     }
     /* Run benchmark with command in the remainder of the arguments. */
     if (argc) {
@@ -2032,6 +2083,8 @@ int main(int argc, char **argv) {
     } while(config.loop);
 
     zfree(data);
+    if(config.gaussian_dist)
+        zfree(gauss_data);
     freeCliConnInfo(config.conn_info);
     if (config.redis_config != NULL) freeRedisConfig(config.redis_config);
 
