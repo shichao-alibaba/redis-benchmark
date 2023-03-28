@@ -443,11 +443,9 @@ static void readFile(char *file) {
     }
     /* Get the number of rows of data and allocate space. */
     exfile.nrows = (size_t)strtoll(strstr(line, ":") + 1, NULL, 10);
-    printf("%lu\n", (size_t)config.randomkeys_keyspacelen);
     if ((size_t)config.randomkeys_keyspacelen < exfile.nrows)
         exfile.nrows = (size_t)config.randomkeys_keyspacelen;
     exfile.nrows = exfile.nrows > MAX_ROWS ? MAX_ROWS : exfile.nrows;
-    printf("%lu\n", exfile.nrows);
     exfile.data = zmalloc(exfile.nrows * MAX_COLS);
 
     /* Read file data. */
