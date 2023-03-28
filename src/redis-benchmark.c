@@ -77,9 +77,13 @@
 #define CLIENT_GET_EVENTLOOP(c) \
     (c->thread_id >= 0 ? config.threads[c->thread_id]->el : config.el)
 
-static char *gauss_data;           /* Randomized gaussian data(keys) */
-static size_t gauss_index = 0;     /* Current index of the gauss_data */
-static long long total_rows = 0;   /* Real rows of gauss_data */
+static struct exfile {
+    char *data;
+    size_t nrows;
+    redisAtomic size_t index;
+    int type;
+} exfile;
+
 struct benchmarkThread;
 struct clusterNode;
 struct redisConfig;
@@ -128,7 +132,7 @@ static struct config {
     redisAtomic int is_updating_slots;
     redisAtomic int slots_last_update;
     int enable_tracking;
-    int gaussian_dist;
+    int external_data;
     pthread_mutex_t liveclients_mutex;
     pthread_mutex_t is_updating_slots_mutex;
     int resp3; /* use RESP3 */
@@ -424,35 +428,58 @@ static void resetClient(client c) {
     c->pending = config.pipeline;
 }
 
-static void readGaussianData() {
-    FILE *fp = fopen("../data/gauss_data.csv", "r");
+static void readFile(char *file) {
+    FILE *fp = fopen(file, "r");
     if (fp == NULL) {
         fprintf(stderr, "Error: cannot open file.\n");
         exit(1);
     }
-
-    long long i = 0;
+    /* Get the metadata of the first row. */
+    size_t i = 0;
     char line[2 * MAX_COLS];
     if (fgets(line, 2 * MAX_COLS, fp) == NULL || strstr(line, "key") == NULL) {
         fprintf(stderr, "Error: incorrect file content.\n");
-        fclose(fp);
         exit(1);
     }
+    /* Get the number of rows of data and allocate space. */
+    exfile.nrows = (size_t)strtoll(strstr(line, ":") + 1, NULL, 10);
+    printf("%lu\n", (size_t)config.randomkeys_keyspacelen);
+    if ((size_t)config.randomkeys_keyspacelen < exfile.nrows)
+        exfile.nrows = (size_t)config.randomkeys_keyspacelen;
+    exfile.nrows = exfile.nrows > MAX_ROWS ? MAX_ROWS : exfile.nrows;
+    printf("%lu\n", exfile.nrows);
+    exfile.data = zmalloc(exfile.nrows * MAX_COLS);
 
-    total_rows = strtoll(strstr(line, ":") + 1, NULL, 10);
-    total_rows = total_rows > MAX_ROWS ? MAX_ROWS : total_rows;
-    gauss_data = zmalloc(total_rows * MAX_COLS);
-
-    while (fgets(gauss_data + i*MAX_COLS, MAX_COLS, fp) != NULL)
+    /* Read file data. */
+    while (fgets(exfile.data + i*MAX_COLS, MAX_COLS, fp) != NULL)
         i++;
     
     fclose(fp);
 }
 
-static size_t getGaussianKey() {
-    size_t key = (size_t)atoi(gauss_data + gauss_index*MAX_COLS);
-    gauss_index = (gauss_index + 1) % total_rows;
-    return key;
+static void readExternalData() {
+    switch (exfile.type) {
+        case 1:
+            readFile("../data/gauss_data.csv");
+            break;
+        case 2:
+            readFile("../data/LT_data.csv");
+            break;
+        case 3:
+            readFile("../data/uniform_data.csv");
+            break;
+    }
+}
+
+static void getRandomizeKey(char *p) {
+    size_t j, index;
+    atomicGetIncr(exfile.index, index, 1);
+    index = index % exfile.nrows;
+    char *t = exfile.data +  index*MAX_COLS + 11;
+    for (j = 0; j < 12; j++) {
+        *p = *t;
+        p--,t--;
+    }
 }
 
 static void randomizeClientKey(client c) {
@@ -462,8 +489,9 @@ static void randomizeClientKey(client c) {
         char *p = c->randptr[i]+11;
         size_t r = 0;
         if (config.randomkeys_keyspacelen != 0) {
-            if(config.gaussian_dist) {
-                r = getGaussianKey();
+            if (config.external_data) {
+                getRandomizeKey(p);
+                continue;
             } else {
                 r = random() % config.randomkeys_keyspacelen;
             }
@@ -1568,8 +1596,15 @@ int parseOptions(int argc, char **argv) {
             config.cluster_mode = 1;
         } else if (!strcmp(argv[i],"--enable-tracking")) {
             config.enable_tracking = 1;
-        } else if (!strcmp(argv[i],"--gaussian-dist")) {
-            config.gaussian_dist = 1;
+        } else if (!strcmp(argv[i],"--gauss-dist")) {
+            config.external_data = 1;
+            exfile.type = 1;
+        } else if (!strcmp(argv[i],"--longtail-dist")) {
+            config.external_data = 1;
+            exfile.type = 2;
+        } else if (!strcmp(argv[i],"--uniform-dist")) {
+            config.external_data = 1;
+            exfile.type = 3;
         } else if (!strcmp(argv[i],"--help")) {
             exit_status = 0;
             goto usage;
@@ -1611,7 +1646,7 @@ int parseOptions(int argc, char **argv) {
         }
     }
 
-    config.gaussian_dist &= config.randomkeys;
+    config.external_data &= config.randomkeys;
     return i;
 
 invalid:
@@ -1650,8 +1685,10 @@ usage:
 "                    range.\n"
 "                    Note: If -r is omitted, all commands in a benchmark will\n"
 "                    use the same key.\n"
-"--gaussian-dist     Use keys that match the Gaussian distribution.\n"
-"                    Note: If -r is omitted, this option will be invalid.\n"
+"--gauss-dist        Use keys that match the Gaussian distribution.\n"
+"--longtail-dist     Use keys that match the Long-tail distribution.\n"
+"--uniform-dist      Use keys that match the Uniform distribution.\n"
+"                    Note: If -r is omitted, the above three options will be invalid.\n"
 " -P <numreq>        Pipeline <numreq> requests. Default 1 (no pipeline).\n"
 " -q                 Quiet. Just show query/sec values\n"
 " --precision        Number of decimal places to display in latency output (default 0)\n"
@@ -1808,7 +1845,7 @@ int main(int argc, char **argv) {
     config.is_updating_slots = 0;
     config.slots_last_update = 0;
     config.enable_tracking = 0;
-    config.gaussian_dist = 0;
+    config.external_data = 0;
     config.resp3 = 0;
 
     i = parseOptions(argc,argv);
@@ -1904,8 +1941,8 @@ int main(int argc, char **argv) {
     if(config.csv){
         printf("\"test\",\"rps\",\"avg_latency_ms\",\"min_latency_ms\",\"p50_latency_ms\",\"p95_latency_ms\",\"p99_latency_ms\",\"max_latency_ms\"\n");
     }
-    if(config.gaussian_dist){
-        readGaussianData();
+    if(config.external_data){
+        readExternalData();
     }
     /* Run benchmark with command in the remainder of the arguments. */
     if (argc) {
@@ -2083,8 +2120,7 @@ int main(int argc, char **argv) {
     } while(config.loop);
 
     zfree(data);
-    if(config.gaussian_dist)
-        zfree(gauss_data);
+    if(config.external_data) zfree(exfile.data);
     freeCliConnInfo(config.conn_info);
     if (config.redis_config != NULL) freeRedisConfig(config.redis_config);
 
